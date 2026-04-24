@@ -1,0 +1,108 @@
+{
+  "name": "Incident Response Agent (Simple)",
+  "nodes": [
+    {
+      "id": "n01",
+      "name": "Webhook: Receive Incident",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [500, 100],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "incident",
+        "responseMode": "responseNode"
+      }
+    },
+
+    {
+      "id": "n02",
+      "name": "ML Classify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [500, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.PYTHON_SERVICE_URL }}/classify",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ text: $json.body.description, source_system: $json.body.source_system }) }}"
+      }
+    },
+
+    {
+      "id": "n03",
+      "name": "AI Agent: Triage + Remediation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [500, 500],
+      "credentials": {
+        "httpHeaderAuth": { "id": "groq-cred", "name": "Groq API Key" }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ model: 'llama3-70b-8192', response_format: { type: 'json_object' }, messages: [{ role: 'system', content: 'You are an autonomous incident response agent for a banking operations center. Given the incident and ML classifier output, produce a complete response in one shot. Output ONLY valid JSON with these fields: { affected_system (string), severity (P1|P2|P3|P4), owning_team (string), confidence (0.0-1.0), reasoning (string), remediation_steps (array of strings), requires_human_approval (boolean), estimated_resolution_minutes (number) }' }, { role: 'user', content: 'Incident: ' + $('Webhook: Receive Incident').item.json.body.description + '\\nML Prediction: ' + JSON.stringify($json) }] }) }}"
+      }
+    },
+
+    {
+      "id": "n04",
+      "name": "Notify Team",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [500, 700],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ (function() { const r = JSON.parse($json.choices[0].message.content); const icons = { P1: '🚨', P2: '⚠️', P3: '📋', P4: '🔵' }; const channels = { P1: '#incidents-war-room', P2: '#incidents', P3: '#ops-tickets', P4: '#ops-log' }; return JSON.stringify({ channel: channels[r.severity] || '#incidents', text: (icons[r.severity] || 'ℹ️') + ' *' + r.severity + ' — ' + r.affected_system + '*\\n' + $('Webhook: Receive Incident').item.json.body.description + '\\n*Team:* ' + r.owning_team + ' | *ETA:* ' + r.estimated_resolution_minutes + ' min\\n*Steps:* ' + r.remediation_steps.slice(0,3).join(' → ') }); })() }}"
+      }
+    },
+
+    {
+      "id": "n05",
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [500, 900],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ incident_id: $('Webhook: Receive Incident').item.json.body.incident_id, result: JSON.parse($('AI Agent: Triage + Remediation').item.json.choices[0].message.content), timestamp: new Date().toISOString() }) }}",
+        "options": { "responseCode": 200 }
+      }
+    }
+  ],
+
+  "connections": {
+    "Webhook: Receive Incident": {
+      "main": [[{ "node": "ML Classify", "type": "main", "index": 0 }]]
+    },
+    "ML Classify": {
+      "main": [[{ "node": "AI Agent: Triage + Remediation", "type": "main", "index": 0 }]]
+    },
+    "AI Agent: Triage + Remediation": {
+      "main": [[{ "node": "Notify Team", "type": "main", "index": 0 }]]
+    },
+    "Notify Team": {
+      "main": [[{ "node": "Webhook Response", "type": "main", "index": 0 }]]
+    }
+  },
+
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+
+  "_setup": {
+    "env_vars": {
+      "PYTHON_SERVICE_URL": "Your ngrok HTTPS URL  e.g. https://xxxx.ngrok-free.app",
+      "SLACK_WEBHOOK_URL": "Your Slack incoming webhook URL"
+    },
+    "credentials": {
+      "Groq API Key": "HTTP Header Auth — Name: Authorization, Value: Bearer <your-groq-key>"
+    }
+  }
+}
