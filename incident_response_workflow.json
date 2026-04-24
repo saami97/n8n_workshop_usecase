@@ -1,0 +1,525 @@
+{
+  "name": "Autonomous Incident Response Agent",
+  "nodes": [
+    {
+      "id": "n01",
+      "name": "Webhook: Receive Incident",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [500, 100],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "incident",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "notes": "Accepts incident JSON from any of 14 source systems. Expected fields: incident_id, source_system, description, timestamp."
+    },
+
+    {
+      "id": "n02",
+      "name": "ML Classify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [500, 280],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.PYTHON_SERVICE_URL }}/classify",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ text: $json.body.description, source_system: $json.body.source_system }) }}"
+      },
+      "notes": "Calls sklearn multi-label classifier. Returns: affected_system, severity_tier, owning_team."
+    },
+
+    {
+      "id": "n03",
+      "name": "Agent 1: Triage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [500, 460],
+      "credentials": {
+        "httpHeaderAuth": { "id": "groq-cred", "name": "Groq API Key" }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({\n  model: 'llama3-70b-8192',\n  response_format: { type: 'json_object' },\n  messages: [\n    {\n      role: 'system',\n      content: `You are an incident triage agent for a banking operations center. Reconcile the ML prediction with your own analysis of the incident. Use the 5 labeled examples below as few-shot guidance.\\n\\nExamples:\\n1. {incident: 'ATM offline in Branch 12', ml: {system: 'ATM', severity: 'P2'}} -> {affected_system: 'ATM', severity: 'P2', owning_team: 'Infra', confidence: 0.92, ml_model_agreement: true}\\n2. {incident: 'Payments timing out for 200 users', ml: {system: 'Core Banking', severity: 'P1'}} -> {affected_system: 'Payment Gateway', severity: 'P1', owning_team: 'Apps', confidence: 0.88, ml_model_agreement: false, reasoning_summary: 'Timeout pattern points to gateway, not core banking.'}\\n3. {incident: 'Fraud alert on card ending 4821', ml: {system: 'Fraud', severity: 'P2'}} -> {affected_system: 'Fraud Detection', severity: 'P2', owning_team: 'Security', confidence: 0.95, ml_model_agreement: true}\\n4. {incident: 'Branch printer offline', ml: {system: 'Branch IT', severity: 'P4'}} -> {affected_system: 'Branch IT', severity: 'P4', owning_team: 'Infra', confidence: 0.97, ml_model_agreement: true}\\n5. {incident: 'SWIFT transactions delayed by 8 min', ml: {system: 'Core Banking', severity: 'P1'}} -> {affected_system: 'Core Banking', severity: 'P1', owning_team: 'Apps', confidence: 0.85, ml_model_agreement: true}\\n\\nOutput ONLY valid JSON: { affected_system, severity (P1|P2|P3|P4), owning_team, confidence (0.0-1.0), reasoning_summary, ml_model_agreement (boolean) }`\n    },\n    {\n      role: 'user',\n      content: 'Incident: ' + $('Webhook: Receive Incident').item.json.body.description + '\\nML Prediction: ' + JSON.stringify($json)\n    }\n  ]\n}) }}"
+      },
+      "notes": "Few-shot triage agent. Reconciles ML output with LLM analysis. Outputs structured JSON with confidence score."
+    },
+
+    {
+      "id": "n04",
+      "name": "Low Confidence?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [500, 640],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "c01",
+              "leftValue": "={{ JSON.parse($json.choices[0].message.content).confidence }}",
+              "rightValue": 0.7,
+              "operator": { "type": "number", "operation": "lt" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "notes": "TRUE (output 0): confidence < 0.7 → send to Agent 2 Investigator.\nFALSE (output 1): confidence >= 0.7 → skip to Retrieve Runbooks."
+    },
+
+    {
+      "id": "n05",
+      "name": "Retrieve Similar Incidents",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [220, 820],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.PYTHON_SERVICE_URL }}/retrieve",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ query: $('Webhook: Receive Incident').item.json.body.description, top_k: 3, filter_type: 'incident' }) }}"
+      },
+      "notes": "Fetches top-3 similar past incidents from FAISS/ChromaDB for chain-of-thought grounding."
+    },
+
+    {
+      "id": "n06",
+      "name": "Agent 2: Investigator",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [220, 1000],
+      "credentials": {
+        "httpHeaderAuth": { "id": "groq-cred", "name": "Groq API Key" }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({\n  model: 'llama3-70b-8192',\n  response_format: { type: 'json_object' },\n  messages: [\n    {\n      role: 'system',\n      content: 'You are an incident investigator for a banking ops center. Use strict chain-of-thought reasoning before classifying.\\n\\nStep 1: What are the key symptoms in the incident?\\nStep 2: Which banking systems could cause these symptoms?\\nStep 3: Review the similar past incidents provided.\\nStep 4: Rule out candidate systems using retrieved evidence.\\nStep 5: Output final JSON with explicit citations.\\n\\nOutput ONLY valid JSON: { affected_system, severity (P1|P2|P3|P4), owning_team, confidence (0.0-1.0), reasoning_summary, ml_model_agreement }'\n    },\n    {\n      role: 'user',\n      content: 'Incident: ' + $('Webhook: Receive Incident').item.json.body.description + '\\n\\nSimilar Past Incidents:\\n' + JSON.stringify($json)\n    }\n  ]\n}) }}"
+      },
+      "notes": "Chain-of-thought investigator. Only runs when Agent 1 confidence < 0.7. Re-outputs the same JSON schema with updated confidence."
+    },
+
+    {
+      "id": "n07",
+      "name": "Retrieve Runbooks",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [500, 1180],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.PYTHON_SERVICE_URL }}/retrieve",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ query: $('Webhook: Receive Incident').item.json.body.description, top_k: 3, filter_type: 'runbook' }) }}"
+      },
+      "notes": "Fetches top-3 runbook chunks from FAISS/ChromaDB. Receives from both confidence branches."
+    },
+
+    {
+      "id": "n08",
+      "name": "Agent 3: Remediation Planner",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [500, 1360],
+      "credentials": {
+        "httpHeaderAuth": { "id": "groq-cred", "name": "Groq API Key" }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({\n  model: 'llama3-70b-8192',\n  response_format: { type: 'json_object' },\n  messages: [\n    {\n      role: 'system',\n      content: 'You are a remediation planner for a banking operations center. Generate a numbered playbook grounded strictly in the provided runbook chunks. Every step MUST cite a runbook using [RB-XXX] format. If a step cannot be cited, flag it as unsupported.\\n\\nOutput ONLY valid JSON: { diagnostic_steps (array), remediation_steps (array), verification_steps (array), rollback_plan (string), requires_human_approval (boolean), estimated_resolution_minutes (number) }'\n    },\n    {\n      role: 'user',\n      content: 'Incident: ' + $('Webhook: Receive Incident').item.json.body.description + '\\n\\nRetrieved Runbooks:\\n' + JSON.stringify($json)\n    }\n  ]\n}) }}"
+      },
+      "notes": "RAG-grounded remediation planner. All steps cite runbook IDs. Also receives retried input from Agent 4 feedback loop."
+    },
+
+    {
+      "id": "n09",
+      "name": "Agent 4: LLM Judge",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [500, 1540],
+      "credentials": {
+        "httpHeaderAuth": { "id": "groq-cred", "name": "Groq API Key" }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({\n  model: 'llama3-70b-8192',\n  response_format: { type: 'json_object' },\n  messages: [\n    {\n      role: 'system',\n      content: 'You are a strict quality judge for incident response playbooks. Score the playbook on 4 dimensions, each 1–10:\\n- groundedness: Are all steps supported by retrieved runbooks? (no hallucination)\\n- completeness: Does it cover diagnosis, fix, and verification?\\n- safety: Are destructive actions gated? Is there a rollback plan?\\n- specificity: Are steps concrete (commands, paths) not vague (check the logs)?\\n\\nOutput ONLY valid JSON: { groundedness, completeness, safety, specificity, average_score, feedback (actionable suggestions for improvement) }'\n    },\n    {\n      role: 'user',\n      content: 'Original Incident: ' + $('Webhook: Receive Incident').item.json.body.description + '\\n\\nPlaybook to Judge:\\n' + $json.choices[0].message.content\n    }\n  ]\n}) }}"
+      },
+      "notes": "LLM-as-judge. Scores playbook on groundedness, completeness, safety, specificity. If average_score < 7, triggers one retry."
+    },
+
+    {
+      "id": "n10",
+      "name": "Score Acceptable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [500, 1720],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false, "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "c02",
+              "leftValue": "={{ JSON.parse($json.choices[0].message.content).average_score }}",
+              "rightValue": 7,
+              "operator": { "type": "number", "operation": "gte" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "notes": "TRUE (output 0): avg >= 7 → proceed to routing.\nFALSE (output 1): avg < 7 → retry Agent 3 once with judge feedback."
+    },
+
+    {
+      "id": "n11",
+      "name": "Agent 3: Retry with Feedback",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [820, 1900],
+      "credentials": {
+        "httpHeaderAuth": { "id": "groq-cred", "name": "Groq API Key" }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({\n  model: 'llama3-70b-8192',\n  response_format: { type: 'json_object' },\n  messages: [\n    {\n      role: 'system',\n      content: 'You are a remediation planner. Revise your playbook based on specific judge feedback. Maintain the same output schema: { diagnostic_steps, remediation_steps, verification_steps, rollback_plan, requires_human_approval, estimated_resolution_minutes }. Address each point in the feedback directly.'\n    },\n    {\n      role: 'user',\n      content: 'Incident: ' + $('Webhook: Receive Incident').item.json.body.description + '\\n\\nJudge Feedback: ' + JSON.parse($json.choices[0].message.content).feedback\n    }\n  ]\n}) }}"
+      },
+      "notes": "One-time retry. Prevents infinite loops. Feeds back into Route by Severity."
+    },
+
+    {
+      "id": "n12",
+      "name": "Route by Severity",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [500, 2080],
+      "parameters": {
+        "mode": "rules",
+        "output": "single",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "id": "r01",
+                    "leftValue": "={{ JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).severity }}",
+                    "rightValue": "P1",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "P1 Critical"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "id": "r02",
+                    "leftValue": "={{ JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).severity }}",
+                    "rightValue": "P2",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "P2 High"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "id": "r03",
+                    "leftValue": "={{ JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).severity }}",
+                    "rightValue": "P3",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "P3 Medium"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "id": "r04",
+                    "leftValue": "={{ JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).severity }}",
+                    "rightValue": "P4",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "P4 Low"
+            }
+          ]
+        },
+        "fallbackOutput": "extra"
+      },
+      "notes": "Routes by severity. Receives from both Score Acceptable (pass) and Agent 3 Retry."
+    },
+
+    {
+      "id": "n13",
+      "name": "P1: Slack + PagerDuty",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [80, 2300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ channel: '#incidents-war-room', text: '🚨 *P1 CRITICAL* — ' + $('Webhook: Receive Incident').item.json.body.description + '\\nIncident ID: ' + $('Webhook: Receive Incident').item.json.body.incident_id + '\\nTeam: ' + JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).owning_team }) }}"
+      },
+      "notes": "Sends to #incidents-war-room. In production, add a second HTTP Request node to fire PagerDuty webhook (use webhook.site as mock during capstone)."
+    },
+
+    {
+      "id": "n14",
+      "name": "P2: Slack + Jira",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [340, 2300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ channel: '#incidents', text: '⚠️ *P2 HIGH* — ' + $('Webhook: Receive Incident').item.json.body.description + '\\nIncident ID: ' + $('Webhook: Receive Incident').item.json.body.incident_id + '\\nTeam: ' + JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).owning_team }) }}"
+      },
+      "notes": "Sends Slack alert to team channel. In production, chain a second HTTP Request to create a Jira ticket via Jira REST API."
+    },
+
+    {
+      "id": "n15",
+      "name": "P3: Create Jira Ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [660, 2300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.JIRA_API_URL }}/rest/api/3/issue",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ fields: { project: { key: 'OPS' }, summary: '[P3] ' + $('Webhook: Receive Incident').item.json.body.description, description: { type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text: $('Webhook: Receive Incident').item.json.body.description }] }] }, issuetype: { name: 'Bug' }, priority: { name: 'Medium' } } }) }}"
+      },
+      "notes": "Creates Jira ticket in OPS project. Requires JIRA_API_URL env var and basic auth credentials."
+    },
+
+    {
+      "id": "n16",
+      "name": "P4: Auto-Close",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [920, 2300],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "a01", "name": "status", "value": "auto-closed", "type": "string" },
+            { "id": "a02", "name": "resolution", "value": "={{ 'Low priority incident auto-resolved by AI. System: ' + JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).affected_system }}", "type": "string" },
+            { "id": "a03", "name": "closed_at", "value": "={{ new Date().toISOString() }}", "type": "string" }
+          ]
+        }
+      },
+      "notes": "Auto-closes P4 low-priority incidents. Sets status, AI-drafted resolution, and timestamp."
+    },
+
+    {
+      "id": "n17",
+      "name": "Log to Google Sheets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [500, 2500],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.GOOGLE_SHEETS_WEBHOOK_URL }}",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ incident_id: $('Webhook: Receive Incident').item.json.body.incident_id, source_system: $('Webhook: Receive Incident').item.json.body.source_system, severity: JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).severity, affected_system: JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).affected_system, owning_team: JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).owning_team, triage_confidence: JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).confidence, judge_avg_score: JSON.parse($('Agent 4: LLM Judge').item.json.choices[0].message.content).average_score, timestamp: new Date().toISOString() }) }}"
+      },
+      "notes": "Logs audit trail: incident ID, severity, confidence, judge score, timestamp. Connect all 4 routing branches to this node."
+    },
+
+    {
+      "id": "n18",
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [500, 2680],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ incident_id: $('Webhook: Receive Incident').item.json.body.incident_id, status: 'processed', severity: JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).severity, affected_system: JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).affected_system, owning_team: JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).owning_team, triage_confidence: JSON.parse($('Agent 1: Triage').item.json.choices[0].message.content).confidence, judge_score: JSON.parse($('Agent 4: LLM Judge').item.json.choices[0].message.content).average_score, timestamp: new Date().toISOString() }) }}",
+        "options": { "responseCode": 200 }
+      },
+      "notes": "Returns full audit trail JSON to the caller."
+    }
+  ],
+
+  "connections": {
+    "Webhook: Receive Incident": {
+      "main": [
+        [{ "node": "ML Classify", "type": "main", "index": 0 }]
+      ]
+    },
+    "ML Classify": {
+      "main": [
+        [{ "node": "Agent 1: Triage", "type": "main", "index": 0 }]
+      ]
+    },
+    "Agent 1: Triage": {
+      "main": [
+        [{ "node": "Low Confidence?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Low Confidence?": {
+      "main": [
+        [{ "node": "Retrieve Similar Incidents", "type": "main", "index": 0 }],
+        [{ "node": "Retrieve Runbooks", "type": "main", "index": 0 }]
+      ]
+    },
+    "Retrieve Similar Incidents": {
+      "main": [
+        [{ "node": "Agent 2: Investigator", "type": "main", "index": 0 }]
+      ]
+    },
+    "Agent 2: Investigator": {
+      "main": [
+        [{ "node": "Retrieve Runbooks", "type": "main", "index": 0 }]
+      ]
+    },
+    "Retrieve Runbooks": {
+      "main": [
+        [{ "node": "Agent 3: Remediation Planner", "type": "main", "index": 0 }]
+      ]
+    },
+    "Agent 3: Remediation Planner": {
+      "main": [
+        [{ "node": "Agent 4: LLM Judge", "type": "main", "index": 0 }]
+      ]
+    },
+    "Agent 4: LLM Judge": {
+      "main": [
+        [{ "node": "Score Acceptable?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Score Acceptable?": {
+      "main": [
+        [{ "node": "Route by Severity", "type": "main", "index": 0 }],
+        [{ "node": "Agent 3: Retry with Feedback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Agent 3: Retry with Feedback": {
+      "main": [
+        [{ "node": "Route by Severity", "type": "main", "index": 0 }]
+      ]
+    },
+    "Route by Severity": {
+      "main": [
+        [{ "node": "P1: Slack + PagerDuty", "type": "main", "index": 0 }],
+        [{ "node": "P2: Slack + Jira", "type": "main", "index": 0 }],
+        [{ "node": "P3: Create Jira Ticket", "type": "main", "index": 0 }],
+        [{ "node": "P4: Auto-Close", "type": "main", "index": 0 }]
+      ]
+    },
+    "P1: Slack + PagerDuty": {
+      "main": [
+        [{ "node": "Log to Google Sheets", "type": "main", "index": 0 }]
+      ]
+    },
+    "P2: Slack + Jira": {
+      "main": [
+        [{ "node": "Log to Google Sheets", "type": "main", "index": 0 }]
+      ]
+    },
+    "P3: Create Jira Ticket": {
+      "main": [
+        [{ "node": "Log to Google Sheets", "type": "main", "index": 0 }]
+      ]
+    },
+    "P4: Auto-Close": {
+      "main": [
+        [{ "node": "Log to Google Sheets", "type": "main", "index": 0 }]
+      ]
+    },
+    "Log to Google Sheets": {
+      "main": [
+        [{ "node": "Webhook Response", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "errorWorkflow": ""
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": ""
+  },
+
+  "_readme": {
+    "env_vars_required": [
+      "PYTHON_SERVICE_URL  — ngrok HTTPS URL for your FastAPI service (e.g. https://xxxx.ngrok-free.app)",
+      "SLACK_WEBHOOK_URL   — Incoming webhook URL from your Slack app",
+      "JIRA_API_URL        — Base URL of your Jira instance (e.g. https://yourorg.atlassian.net)",
+      "GOOGLE_SHEETS_WEBHOOK_URL — Google Apps Script web app URL to append rows"
+    ],
+    "credentials_required": [
+      "Groq API Key  — HTTP Header Auth: Header Name = Authorization, Value = Bearer <your-groq-key>",
+      "Jira Basic Auth — HTTP Basic Auth: email + API token"
+    ],
+    "flow_summary": [
+      "1. Webhook receives incident JSON",
+      "2. ML Classify → sklearn /classify endpoint",
+      "3. Agent 1 Triage → Groq LLM (few-shot) reconciles ML + LLM",
+      "4. IF confidence < 0.7 → Agent 2 Investigator (chain-of-thought + /retrieve)",
+      "5. Retrieve Runbooks → /retrieve endpoint",
+      "6. Agent 3 Remediation Planner → RAG-grounded playbook",
+      "7. Agent 4 LLM Judge → scores playbook on 4 dimensions",
+      "8. IF avg score < 7 → Agent 3 Retry with judge feedback (max 1 retry)",
+      "9. Switch by severity → P1/P2/P3/P4 routing",
+      "10. Log to Google Sheets → audit trail",
+      "11. Webhook Response → returns JSON audit trail"
+    ]
+  }
+}
